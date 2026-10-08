@@ -1,6 +1,8 @@
 import argparse
 import os
+import pathlib
 import time
+from typing import Literal, Self
 
 import equinox as eqx
 import jax.numpy as jnp
@@ -10,6 +12,7 @@ from jax import random
 from jaxtyping import Array, Float, PRNGKeyArray
 from matplotlib.collections import LineCollection
 from PIL import Image
+from torch.utils.data import BatchSampler, DataLoader, Dataset, RandomSampler, SequentialSampler
 
 from latent_point_cloud import utils
 
@@ -160,7 +163,6 @@ def integrate_over_time(
     Float[Array, "timestep n_bodies D"],
     Float[Array, "timestep n_bodies D"],
     Float[Array, "timestep n_bodies D"],
-    Float[Array, " timestep"],
 ]:
     """
     Given starting positions and masses, run the n-body simulation for a total of T time, in dt increments.
@@ -171,7 +173,6 @@ def integrate_over_time(
     pos_history = [positions]
     vel_history = [jnp.zeros_like(positions)]
     gravity_history = [gravity_acc]
-    t_history = []
     t = 0
     while t < T:
         # kick-drift-kick from https://github.com/pmocz/nbody-python/blob/master/nbody.py
@@ -190,36 +191,100 @@ def integrate_over_time(
         # update time
         t += dt
 
-        t_history.append(t)
         pos_history.append(positions)
         vel_history.append(velocities)
         gravity_history.append(gravity_acc)
 
-    return (
-        jnp.stack(pos_history),
-        jnp.stack(vel_history),
-        jnp.stack(gravity_history),
-        jnp.stack(t_history),
-    )
+    return (jnp.stack(pos_history), jnp.stack(vel_history), jnp.stack(gravity_history))
 
 
-def get_data(
-    N: int,
+class NBodyDataset(Dataset):
+    input_image: Float[Array, "n_samples spatial"]
+    output_positions: Float[Array, "n_samples n_bodies D"]
+    masses: Float[Array, "n_samples n_bodies"]
+
+    def __init__(
+        self: Self,
+        root: pathlib.Path,
+        data_type: Literal["train", "val", "test"],
+        D: int,
+        N: int,
+        n_samples: int,
+        n_bodies: int,
+        uniform_mass: bool,
+        zero_velocity: bool,
+        dt: float,
+        T: float,
+        key: PRNGKeyArray,
+    ) -> None:
+        file_path = (
+            root
+            / data_type
+            / f"{D}D_L{n_samples}_nbodies{n_bodies}_{uniform_mass}_{zero_velocity}_dt{dt}_T{T}.npy"
+        )
+        (root / data_type).mkdir(exist_ok=True)  # construct train/val/test dir if its missing
+
+        if file_path.is_file():
+            data_dict = jnp.load(file_path).item()
+            self.masses = data_dict["masses"]
+            self.input_images = eqx.filter_vmap(get_input_image)(
+                N, data_dict["input_positions"], self.masses
+            )
+            self.output_positions = data_dict["output_positions"]
+
+        else:
+            positions, masses, velocities = eqx.filter_vmap(get_initial_bodies_cloud)(
+                N, D, n_bodies, random.split(key, num=n_samples), uniform_mass, zero_velocity
+            )
+            self.input_images = eqx.filter_vmap(get_input_image)(N, positions, masses)
+
+            # (n_samples, n_bodies, tensor)
+            pos_history, vel_history, gravity_history = eqx.filter_vmap(integrate_over_time)(
+                positions, masses, velocities, dt, T
+            )
+            self.output_positions = pos_history[:, -1]
+            self.masses = masses
+
+            # save positions, velocities, masses, and output positions, construct images at runtime
+            jnp.save(
+                file_path,
+                {
+                    "input_positions": positions,
+                    "input_velocities": velocities,
+                    "masses": self.masses,
+                    "output_positions": self.output_positions,
+                },
+                allow_pickle=True,
+            )
+
+    def __len__(self: Self) -> int:
+        return len(self.input_images)
+
+    def __getitem__(
+        self: Self, idx: int
+    ) -> tuple[Float[Array, " spatial"], Float[Array, "n_bodies D"]]:
+        return self.input_images[idx], self.output_positions[idx]
+
+
+def get_dataset(
+    data_dir: pathlib.Path,
     D: int,
+    N: int,
     n_bodies: int,
     dt: float,
     T: float,
     key: PRNGKeyArray,
-    num_images: int,
+    n_samples: int,
     uniform_mass: bool,
     zero_velocity: bool,
 ) -> tuple[
-    Float[Array, "n_images spatial"],
-    Float[Array, "n_images n_bodies D"],
-    Float[Array, "n_images n_bodies"],
+    Float[Array, "n_samples spatial"],
+    Float[Array, "n_samples n_bodies D"],
+    Float[Array, "n_samples n_bodies"],
 ]:
+
     positions, masses, velocities = eqx.filter_vmap(get_initial_bodies_cloud)(
-        N, D, n_bodies, random.split(key, num=num_images), uniform_mass, zero_velocity
+        N, D, n_bodies, random.split(key, num=n_samples), uniform_mass, zero_velocity
     )
     input_images = eqx.filter_vmap(get_input_image)(N, positions, masses)
 
@@ -229,6 +294,42 @@ def get_data(
     plot_pos(pos_history[0], vel_history[0], gravity_history[0], ts[0], masses[0])
 
     return input_images, pos_history[:, -1], masses
+
+
+def get_data(
+    data_dir: pathlib.Path,
+    D: int,
+    N: int,
+    n_bodies: int,
+    dt: float,
+    T: float,
+    n_train: int,
+    n_val: int,
+    n_test: int,
+    uniform_mass: bool,
+    zero_velocity: bool,
+    key: PRNGKeyArray,
+    batch_size: int,
+) -> tuple[DataLoader[NBodyDataset], DataLoader[NBodyDataset], DataLoader[NBodyDataset]]:
+    subkey1, subkey2, subkey3 = random.split(key, num=3)
+    train_dataset = NBodyDataset(
+        data_dir, "train", D, N, n_train, n_bodies, uniform_mass, zero_velocity, dt, T, subkey1
+    )
+
+    val_dataset = NBodyDataset(
+        data_dir, "val", D, N, n_val, n_bodies, uniform_mass, zero_velocity, dt, T, subkey2
+    )
+
+    test_dataset = NBodyDataset(
+        data_dir, "test", D, N, n_test, n_bodies, uniform_mass, zero_velocity, dt, T, subkey3
+    )
+    # TODO: no normalization?
+
+    train_dl = DataLoader(train_dataset, batch_size, shuffle=True)
+    val_dl = DataLoader(val_dataset, batch_size, shuffle=False)
+    test_dl = DataLoader(test_dataset, batch_size, shuffle=False)
+
+    return train_dl, val_dl, test_dl
 
 
 def handleArgs() -> argparse.Namespace:
@@ -245,7 +346,29 @@ def handleArgs() -> argparse.Namespace:
     Can do --n-val 128, but for speed do this
     """
     parser = utils.get_common_parser()
-    parser.add_argument("-N", help="image side lengths", type=int)
+
+    # Data generation
+    parser.add_argument("-D", help="the dimension of the space", type=int, default=2)
+    parser.add_argument("--side-length", help="image side lengths", type=int)
+    parser.add_argument(
+        "--n-bodies", help="number of bodies to orbit each other", type=int, default=10
+    )
+    parser.add_argument("--dt", help="time increment for the simulation", type=float, default=0.01)
+    parser.add_argument(
+        "--total-time", help="total time for the simulation to run", type=float, default=10
+    )
+    parser.add_argument(
+        "uniform_mass",
+        help="use uniform masses",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
+    parser.add_argument(
+        "zero_velocity",
+        help="use zero initial velocities",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
 
     parser.add_argument(
         "--plot-gif",
@@ -260,12 +383,23 @@ def handleArgs() -> argparse.Namespace:
 
 
 if __name__ == "__main__":
-    key = random.PRNGKey(time.time_ns())
-    N = 16
-    D = 2
-    n_bodies = 10
-    n_images = 1
-    dt = 0.01
-    T = 10
+    args = handleArgs()
 
-    data = get_data(N, D, n_bodies, dt, T, key, n_images)
+    key = random.PRNGKey(time.time_ns())
+    data_dir = pathlib.Path(args.data_dir)  # don't let it be None
+
+    data = get_data(
+        data_dir,
+        args.D,
+        args.side_length,
+        args.n_bodies,
+        args.dt,
+        args.total_time,
+        args.n_train,
+        args.n_val,
+        args.n_test,
+        args.uniform_mass,
+        args.zero_velocity,
+        key,
+        args.batch_size,
+    )
