@@ -1,0 +1,26 @@
+[project]
+name = "latent-point-cloud"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+authors = [
+    { name = "Wilson Gregory", email = "wilson.g.gregory@gmail.com" }
+]
+requires-python = ">=3.13"
+dependencies = [
+    "equinox>=0.13.8",
+    "jax>=0.11.2",
+    "jaxtyping>=0.3.11",
+    "matplotlib>=3.11.2",
+]
+
+[project.scripts]
+latent-point-cloud = "latent_point_cloud:main"
+
+[build-system]
+requires = ["uv_build>=0.12.23,<0.13.0"]
+build-backend = "uv_build"
+
+[tool.ruff]
+# Set the maximum line length to 120 characters
+line-length = 100
