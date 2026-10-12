@@ -20,7 +20,7 @@ def get_common_parser() -> argparse.ArgumentParser:
 
     parser.add_argument_group("training", "arguments related to training the models")
     parser.add_argument("-e", "--epochs", help="number of epochs to run", type=int, default=50)
-    parser.add_argument("-b", "--batch", help="batch size", type=int, default=8)
+    parser.add_argument("-b", "--batch_size", help="batch size", type=int, default=8)
     parser.add_argument("-t", "--n-trials", help="number of trials to run", type=int, default=1)
     parser.add_argument("--seed", help="the random number seed", type=int, default=None)
     parser.add_argument(
