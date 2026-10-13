@@ -440,7 +440,7 @@ def train_and_eval(
         trained_model, _ = training.load(model_path, model)
     else:
         steps_per_epoch = math.ceil(len(train_dl.dataset) / batch_size)
-        trained_model, _, _, train_time = training.train(
+        trained_model, _, _, _ = training.train(
             train_dl,
             mapper,
             model,
@@ -453,14 +453,10 @@ def train_and_eval(
             ),
             val_dl,
             val_mapper=mapper,
+            save_model=model_path,
             verbose=verbose,
             is_wandb=is_wandb,
         )
-
-        if model_path:
-            assert not model_path.is_file() or overwrite_save_model
-            # TODO: need to save batch_stats as well
-            training.save(model_path, trained_model, {"train_time": train_time})
 
     train_loss = training.evaluate_loop(mapper, trained_model, train_dl)
     print(f"Train Loss: {train_loss}")
@@ -468,31 +464,6 @@ def train_and_eval(
     print(f"Val Loss: {val_loss}")
     test_loss = training.evaluate_loop(mapper, trained_model, test_dl)
     print(f"Test Loss: {test_loss}")
-
-    # if images_dir is not None:
-    #     val_x_one, val_y_one = next(iter(val_dl))
-    #     assert isinstance(val_x_one, geom.MultiImage)
-    #     assert isinstance(val_y_one, geom.MultiImage)
-    #     # (1,channels*future_steps,spatial,tensor)
-    #     val_x_one = val_x_one.get_one(keepdims=False).get_one()
-    #     val_y_one = val_y_one.get_one(keepdims=False).get_one()
-    #     # train_mapper doesn't reverse the preprocessing
-    #     mapper = ContractilityMapper(
-    #         [geom.Losses.NRMSE],
-    #         [False],
-    #         [True],
-    #         preprocessor,
-    #         past_steps,
-    #         future_steps,
-    #         1,
-    #         mask_sig,
-    #         eps=1e-5,
-    #     )
-    #     pred_y, one_loss, _ = mapper.map_plus_loss(trained_model, val_x_one, val_y_one, batch_stats)
-    #     pred_y.append((), 0, val_y_one[(), 0][:, -1:], axis=1)  # add the mask back to pred_y
-    #     print(f"One Loss: {one_loss}")
-    #     components = ["zyxin", "actin", "mask", "force_x", "force_y"]
-    #     plot_multi_image(pred_y, val_y_one, images_dir / f"{model_name_extended}.png", components)
 
     return train_loss, val_loss, test_loss
 

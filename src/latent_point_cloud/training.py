@@ -17,9 +17,9 @@ from torch.utils.data import DataLoader
 # ~~~~~~~~~~~~~~~~~~~~~~ Saving/Loading ~~~~~~~~~~~~~~~~~~~~~~
 
 
-def save(filename: str | pathlib.Path, model: eqx.Module, further_args: dict | None = None) -> None:
+def save(filename: pathlib.Path, model: eqx.Module, further_args: dict | None = None) -> None:
     """
-    New version of save, allows you to save any serializable args.
+    Save the model with further args.
 
     args:
         filename: the file to save the model to
@@ -33,9 +33,9 @@ def save(filename: str | pathlib.Path, model: eqx.Module, further_args: dict | N
         eqx.tree_serialise_leaves(f, model)
 
 
-def load(filename: str | pathlib.Path, model: eqx.Module) -> tuple[eqx.Module, dict]:
+def load(filename: pathlib.Path, model: eqx.Module) -> tuple[eqx.Module, dict]:
     """
-    Load an equinox model.
+    Load an equinox model, with possibly further args.
 
     args:
         filename: the file to load the model from
@@ -53,11 +53,15 @@ def load(filename: str | pathlib.Path, model: eqx.Module) -> tuple[eqx.Module, d
 
 
 class Loss(ABC):
-    # a generic loss functor
+    """
+    A generic loss function. It must implement a single method __call__.
+    """
 
     @abstractmethod
     def __call__(self: Self, x: Float[Array, "..."], y: Float[Array, "..."]) -> Float[Array, ""]:
-        pass
+        """
+        Simple loss function, takes in arrays x and y of variable shape, and returns an array of a single value.
+        """
 
 
 class Mapper:
@@ -65,19 +69,19 @@ class Mapper:
     Functor for map_and_loss in train, map_loss_in_batches, etc, where arguments can be provided
     beforehand. In this case, it is useful for smse vs relative error, and whether to learn the
     residual or not.
+
+    Much of the functionality should now be done by extending the Loss class, but this allows you to
+    have multiple losses, and possibly a more complicated mapper.
     """
 
     losses: Sequence[Loss]
 
     def __init__(self: Self, losses: Loss | Sequence[Loss]) -> None:
         """
-        Docstring for __init__
+        Constructor, takes a list of losses.
 
         args:
             losses: a sequence of losses, must be at least 1
-            residual: Whether the network should learn the residual, defaults to False
-            reduce: How to reduce the batch dimension, defaults to 'mean' but can also be None
-            eps: epsilon value to use for nrmse and lr_rel, avoid dividing by 0
         """
         losses = [losses] if isinstance(losses, Loss) else losses
         assert len(losses) > 0, "Mapper::init: At least one loss required."
@@ -122,8 +126,7 @@ def evaluate(
 ) -> Float[Array, ""]:
     """
     Evaluate the model using the mapper on the input data x and output data y. This pmaps over
-    multiple GPUs if available. The number of gpus must evenly divide batch_size as well as as
-    any remainder of the MultiImage.
+    multiple GPUs if available. The number of gpus must evenly divide batch_size.
 
     args:
         model: the model to run through map_and_loss
@@ -145,23 +148,19 @@ def evaluate(
     return jnp.mean(loss, axis=0)
 
 
-def evaluate_loop(mapper: Mapper, model: eqx.Module, dataloader: DataLoader) -> jax.Array:
+def evaluate_loop(mapper: Mapper, model: eqx.Module, dataloader: DataLoader) -> Float[Array, ""]:
     """
-    Runs map_and_loss for the entire x, y, splitting into batches if the MultiImage is larger than
-    the batch_size. This is helpful to run a whole validation/test set through map and loss when you need
-    to split those over batches for memory reasons. Automatically pmaps over multiple gpus, so the number
-    of gpus must evenly divide batch_size as well as as any remainder of the MultiImage.
+    Calls evaluate over every minibatch of the data loader, then averages the losses. This expects
+    that the dataloader returns pytorch tensors (since we are using the default pytorch collate),
+    but this may change in the future.
 
     args:
-        map_and_loss: function that takes in model, X_batch, Y_batch, and
-            aux_data and returns the loss and aux_data
+        mapper: the designated Mapper
         model: the model to run through map_and_loss
         dataloader: the dataloader for input and output multi image data
-        aux_data: auxilliary data, such as batch stats. Passed to the function is has_aux is True.
-        reduce: how to reduce between batches, defaults to mean
 
     Returns:
-        Average loss over the entire BatchMultiImage
+        Average loss over the entire dataloader of minibatches.
     """
     losses = []
     for x_batch, y_batch in dataloader:
@@ -184,11 +183,10 @@ def train_step(
     Perform one step and gradient update of the model. Uses filter_pmap to use multiple gpus.
 
     args:
-        mapper: map and loss function where the input is a model pytree, x, y, and
-            aux_data, and returns a float loss and aux_data
+        mapper: map and loss function where the input is a model pytree, x, y, and returns the loss
         model: the model
-        optim: the optimizer
-        opt_state:
+        optim: the optax optimizer
+        opt_state: the optax optimizer opt state
         x: input data
         y: target data
 
@@ -243,7 +241,7 @@ def train(
     optimizer: optax.GradientTransformation,
     val_dataloader: DataLoader | None = None,
     val_mapper: Mapper | None = None,
-    save_model: str | None = None,
+    save_model: pathlib.Path | None = None,
     verbose: int = 1,
     is_wandb: bool = False,
     wandb_project: str = "",
@@ -259,23 +257,24 @@ def train(
     This version uses pytorch datasets and dataloaders.
 
     args:
-        train_dataloader: dataloader for train input and target data. Each is a MultiImage by k of
-            (images, channels, (N,)*D, (D,)*k)
-        map_and_loss: function that takes in model, X_batch, Y_batch, and aux_data and
-            returns the loss and aux_data.
+        train_dataloader: dataloader for train input and target data. These are default pytorch
+            dataloaders, so they should return tensors.
+        mapper: Mapper class to do the mapping and loss for training
         model: Model pytree
-        stop_condition: when to stop the training process, currently only 1 condition
-            at a time
-        batch_size: the size of each mini-batch in SGD
+        total_epochs: the number of training epochs to run
         optimizer: optimizer
-        val_dataloader: dataloader for val input and target data. Each is a MultiImage by k of
-            (images, channels, (N,)*D, (D,)*k)
-        save_model: if string, save model every 10 epochs, defaults to None
-        aux_data: initial aux data passed in to map_and_loss when has_aux is true.
+        val_dataloader: dataloader for vak input and target data. These are default pytorch
+            dataloaders, so they should return tensors.
+        val_mapper: Mapper for validation, if None it will default to the train mapper
+        save_model: will save the model at the end of training if provided
         is_wandb: whether wandb experiment tracking has been initiated and should be logged to
+        wandb_project: project for wandb
+        wandb_entity: wandb user, seems like it will be done automatically?
+        model_name: model name to save to wandb
+        args: additional args to provide to wandb logging at the beginning
 
     returns:
-        A tuple of best model in inference mode, aux_data, epoch loss, val loss, and train_time
+        A tuple of best model in inference mode, epoch loss, val loss, and train_time
     """
     if is_wandb:
         args = {} if args is None else args
@@ -334,7 +333,7 @@ def train(
                 print(f"Epoch {epoch} Train: {epoch_loss:.7f} Epoch time: {epoch_time:.5f}")
 
     if save_model:
-        save(save_model, model)
+        save(save_model, model, {"train_time": total_train_time})
 
     if is_wandb:
         wandb.finish()
