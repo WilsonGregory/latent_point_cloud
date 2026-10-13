@@ -1,20 +1,25 @@
 import argparse
+import math
 import os
 import pathlib
 import time
+from collections.abc import Callable, Sequence
 from typing import Literal, Self
 
 import equinox as eqx
+import jax
 import jax.numpy as jnp
 import matplotlib.axes
 import matplotlib.pyplot as plt
+import numpy as np
+import optax
 from jax import random
 from jaxtyping import Array, Float, PRNGKeyArray
 from matplotlib.collections import LineCollection
 from PIL import Image
 from torch.utils.data import DataLoader, Dataset
 
-from latent_point_cloud import utils
+from latent_point_cloud import training, utils
 
 G = 1  # the gravitational constant. These are not in actual units yet, so we can use 1.
 TINY = 1e-5  # avoid divide by 0 issues
@@ -85,7 +90,7 @@ def plot_pos(
 
 
 def get_initial_bodies_cloud(
-    N: int, D: int, n_bodies: int, key: PRNGKeyArray, uniform_mass: bool, zero_velocity: bool
+    N: int, D: int, n_bodies: int, key: PRNGKeyArray, uniform_mass: bool, initial_velocity: bool
 ) -> tuple[Float[Array, "n_bodies D"], Float[Array, " n_bodies"], Float[Array, "n_bodies D"]]:
     if (N % 2) != 0:
         raise ValueError(f"Side length must be even, got {N}")
@@ -105,18 +110,18 @@ def get_initial_bodies_cloud(
         masses = random.uniform(subkey2, shape=(n_bodies,), minval=0.5)
         masses = masses * (20 / jnp.sum(masses))
 
-    if zero_velocity:
-        velocities = jnp.zeros((n_bodies, D))
-    else:
+    if initial_velocity:
         velocities = random.normal(subkey3, shape=(n_bodies, D))
         velocities -= jnp.mean(masses[:, None] * velocities, 0) / jnp.mean(masses)
+    else:
+        velocities = jnp.zeros((n_bodies, D))
 
     return positions, masses, velocities
 
 
 def get_input_image(
     N: int, positions: Float[Array, "n_bodies D"], masses: Float[Array, " n_bodies"]
-) -> Float[Array, " spatial"]:
+) -> Float[Array, "1 spatial"]:
     if (N % 2) != 0:
         raise ValueError(f"Side length must be even, got {N}")
 
@@ -127,7 +132,7 @@ def get_input_image(
     for (x, y), mass in zip(positions, masses):
         point_mass = point_mass.at[x, y].set(mass)
 
-    return point_mass
+    return point_mass[None]
 
 
 def compute_gravity_force(
@@ -207,8 +212,9 @@ def integrate_over_time(
 
 
 class NBodyDataset(Dataset):
-    input_image: Float[Array, "n_samples spatial"]
-    last_positions: Float[Array, "n_samples n_bodies D"]
+    input_image: Float[Array, "n_samples channels spatial"]
+    last_positions: Float[Array, "n_samples n_bodies 1 D"]
+    last_velocities: Float[Array, "n_samples n_bodies 1 D"]
     masses: Float[Array, "n_samples n_bodies"]
 
     def __init__(
@@ -220,39 +226,41 @@ class NBodyDataset(Dataset):
         n_samples: int,
         n_bodies: int,
         uniform_mass: bool,
-        zero_velocity: bool,
+        initial_velocity: bool,
         dt: float,
         T: float,
         key: PRNGKeyArray,
         image_dir: pathlib.Path | None = None,
     ) -> None:
-        data_name = (
-            f"{D}D_L{n_samples}_nbodies{n_bodies}_{uniform_mass}_{zero_velocity}_dt{dt}_T{T}"
-        )
+        uniform_mass_str = "unif-mass" if uniform_mass else "no-unif-mass"
+        initial_velocity_str = "initial-velocity" if initial_velocity else "no-initial-velocity"
+        data_name = f"{D}D_L{n_samples}_nbodies{n_bodies}_{uniform_mass_str}_{initial_velocity_str}_dt{dt}_T{T}"
         file_path = root / data_type / f"{data_name}.npy"
         (root / data_type).mkdir(exist_ok=True)  # construct train/val/test dir if its missing
 
         if file_path.is_file():
             data_dict = jnp.load(file_path, allow_pickle=True).item()
             self.masses = data_dict["masses"]
-            positions = data_dict["positions"]
+            positions = data_dict["positions"]  # (n_samples, timesteps, n_bodies, tensor)
             velocities = data_dict["velocities"]
             gravity_accs = data_dict["gravity_accs"]
             ts = data_dict["ts"]
 
             self.input_images = eqx.filter_vmap(get_input_image)(N, positions[:, 0], self.masses)
-            self.last_positions = positions[:, -1]
+            self.last_positions = positions[:, -1, :, None]
+            self.last_velocities = velocities[:, -1, :, None]
         else:
             initial_positions, masses, initial_velocities = eqx.filter_vmap(
                 get_initial_bodies_cloud
-            )(N, D, n_bodies, random.split(key, num=n_samples), uniform_mass, zero_velocity)
+            )(N, D, n_bodies, random.split(key, num=n_samples), uniform_mass, initial_velocity)
             self.input_images = eqx.filter_vmap(get_input_image)(N, initial_positions, masses)
 
             # (n_samples, timesteps, n_bodies, tensor)
             positions, velocities, gravity_accs, ts = eqx.filter_vmap(integrate_over_time)(
                 initial_positions, masses, initial_velocities, dt, T
             )
-            self.last_positions = positions[:, -1]
+            self.last_positions = positions[:, -1, :, None]
+            self.last_velocities = velocities[:, -1, :, None]
             self.masses = masses
 
             # save positions, velocities, masses, and output positions, construct images at runtime
@@ -282,10 +290,11 @@ class NBodyDataset(Dataset):
     def __len__(self: Self) -> int:
         return len(self.input_images)
 
-    def __getitem__(
-        self: Self, idx: int
-    ) -> tuple[Float[Array, " spatial"], Float[Array, "n_bodies D"]]:
-        return self.input_images[idx], self.last_positions[idx]
+    def __getitem__(self: Self, idx: int) -> tuple[np.ndarray, np.ndarray]:
+        # output as numpy array to be handled automatically by pytorch's dataloader
+        return np.asarray(self.input_images[idx]), np.asarray(
+            jnp.concat([self.last_positions[idx], self.last_velocities[idx]], axis=1)
+        )
 
 
 def get_data(
@@ -299,7 +308,7 @@ def get_data(
     n_val: int,
     n_test: int,
     uniform_mass: bool,
-    zero_velocity: bool,
+    initial_velocity: bool,
     key: PRNGKeyArray,
     batch_size: int,
     image_dir: pathlib.Path,
@@ -314,7 +323,7 @@ def get_data(
         n_train,
         n_bodies,
         uniform_mass,
-        zero_velocity,
+        initial_velocity,
         dt,
         T,
         subkey1,
@@ -322,11 +331,11 @@ def get_data(
     )
 
     val_dataset = NBodyDataset(
-        data_dir, "val", D, N, n_val, n_bodies, uniform_mass, zero_velocity, dt, T, subkey2
+        data_dir, "val", D, N, n_val, n_bodies, uniform_mass, initial_velocity, dt, T, subkey2
     )
 
     test_dataset = NBodyDataset(
-        data_dir, "test", D, N, n_test, n_bodies, uniform_mass, zero_velocity, dt, T, subkey3
+        data_dir, "test", D, N, n_test, n_bodies, uniform_mass, initial_velocity, dt, T, subkey3
     )
     # TODO: no normalization?
 
@@ -337,10 +346,162 @@ def get_data(
     return train_dl, val_dl, test_dl
 
 
+# Model and Training
+
+
+class MSE(training.Loss):
+    def __call__(
+        self: Self, x: Float[Array, "batch channels ..."], y: Float[Array, "batch channels ..."]
+    ) -> Float[Array, ""]:
+        # mean over batch, squared error over other stuff
+        return jnp.mean(jnp.sum((x - y) ** 2, axis=tuple(range(1, x.ndim))))
+
+
+class SimpleConv(eqx.Module):
+    """
+    A simple convolution model, takes in an image with in_c channels and outputs n_particles with
+    positions and velocities. The model consists of convolution layers with nonlinearities,
+    followed by a single fully connected linear layer to the output.
+    """
+
+    D: int
+    n_particles: int
+    activation_f: Callable
+
+    layers: list[eqx.nn.Conv]
+    decoder: eqx.nn.Linear
+
+    def __init__(
+        self: Self,
+        D: int,
+        in_c: int,
+        n_particles: int,
+        width: int,
+        n_hidden_layers: int,
+        spatial_size: int,
+        kernel_size: int | Sequence[int] = 3,
+        activation_f: Callable = jax.nn.gelu,
+        *,
+        key: PRNGKeyArray,
+    ) -> None:
+        assert n_hidden_layers > 0
+
+        self.D = D
+        self.n_particles = n_particles
+        self.activation_f = activation_f
+
+        key, subkey = random.split(key)
+        self.layers = [eqx.nn.Conv(D, in_c, width, kernel_size, padding="SAME", key=subkey)]
+        for _ in range(n_hidden_layers):
+            key, subkey = random.split(key)
+            self.layers.append(
+                eqx.nn.Conv(D, width, width, kernel_size, padding="SAME", key=subkey)
+            )
+
+        key, subkey = random.split(key)
+        self.decoder = eqx.nn.Linear(width * spatial_size, n_particles * D * 2, key=subkey)
+
+    def __call__(self: Self, x: Float[Array, "in_c spatial"]) -> Float[Array, "n_particles 2 D"]:
+        for layer in self.layers:
+            x = self.activation_f(layer(x))
+
+        x = self.decoder(x.ravel())
+        positions = x[: self.n_particles * self.D].reshape(self.n_particles, self.D)
+        velocities = x[self.n_particles * self.D : 2 * self.n_particles * self.D].reshape(
+            self.n_particles, self.D
+        )
+
+        return jnp.stack([positions, velocities], axis=1)
+
+
+def train_and_eval(
+    data: tuple[DataLoader[NBodyDataset], DataLoader[NBodyDataset], DataLoader[NBodyDataset]],
+    model: eqx.Module,
+    model_name: str,
+    lr: float,
+    batch_size: int,
+    epochs: int,
+    model_dir: pathlib.Path | None = None,
+    overwrite_save_model: bool = False,
+    images_dir: pathlib.Path | None = None,
+    verbose: int = 1,
+    is_wandb: bool = False,
+) -> tuple[Float[Array, ""], ...]:
+    train_dl, val_dl, test_dl = data
+    assert isinstance(train_dl.dataset, NBodyDataset)
+
+    # print(f"Model params: {models.count_params(model):,}")
+
+    mapper = training.Mapper(MSE())
+
+    model_name_extended = f"{model_name}_L{len(train_dl.dataset)}_e{epochs}"
+    model_path = model_dir / f"{model_name_extended}.eqx" if model_dir else None
+    if model_path and model_path.is_file() and not overwrite_save_model:
+        trained_model, _ = training.load(model_path, model)
+    else:
+        steps_per_epoch = math.ceil(len(train_dl.dataset) / batch_size)
+        trained_model, _, _, train_time = training.train(
+            train_dl,
+            mapper,
+            model,
+            epochs,
+            optax.adamw(
+                optax.warmup_cosine_decay_schedule(
+                    1e-8, lr, 5 * steps_per_epoch, epochs * steps_per_epoch, 1e-7
+                ),
+                weight_decay=1e-5,
+            ),
+            val_dl,
+            val_mapper=mapper,
+            verbose=verbose,
+            is_wandb=is_wandb,
+        )
+
+        if model_path:
+            assert not model_path.is_file() or overwrite_save_model
+            # TODO: need to save batch_stats as well
+            training.save(model_path, trained_model, {"train_time": train_time})
+
+    train_loss = training.evaluate_loop(mapper, trained_model, train_dl)
+    print(f"Train Loss: {train_loss}")
+    val_loss = training.evaluate_loop(mapper, trained_model, val_dl)
+    print(f"Val Loss: {val_loss}")
+    test_loss = training.evaluate_loop(mapper, trained_model, test_dl)
+    print(f"Test Loss: {test_loss}")
+
+    # if images_dir is not None:
+    #     val_x_one, val_y_one = next(iter(val_dl))
+    #     assert isinstance(val_x_one, geom.MultiImage)
+    #     assert isinstance(val_y_one, geom.MultiImage)
+    #     # (1,channels*future_steps,spatial,tensor)
+    #     val_x_one = val_x_one.get_one(keepdims=False).get_one()
+    #     val_y_one = val_y_one.get_one(keepdims=False).get_one()
+    #     # train_mapper doesn't reverse the preprocessing
+    #     mapper = ContractilityMapper(
+    #         [geom.Losses.NRMSE],
+    #         [False],
+    #         [True],
+    #         preprocessor,
+    #         past_steps,
+    #         future_steps,
+    #         1,
+    #         mask_sig,
+    #         eps=1e-5,
+    #     )
+    #     pred_y, one_loss, _ = mapper.map_plus_loss(trained_model, val_x_one, val_y_one, batch_stats)
+    #     pred_y.append((), 0, val_y_one[(), 0][:, -1:], axis=1)  # add the mask back to pred_y
+    #     print(f"One Loss: {one_loss}")
+    #     components = ["zyxin", "actin", "mask", "force_x", "force_y"]
+    #     plot_multi_image(pred_y, val_y_one, images_dir / f"{model_name_extended}.png", components)
+
+    return train_loss, val_loss, test_loss
+
+
 def handleArgs() -> argparse.Namespace:
     """
     time uv run python3 scripts/n_body.py \
-    --data-dir data/n_body/ --n-train 8 --n-val 8 --n-test 8 -N 16 \
+    --data-dir data/n_body/ --n-train 128 --n-val 128 --n-test 128 -N 16 \
+    --total-time 1.5 \
     --image-dir images/n_body/
     """
     parser = utils.get_common_parser()
@@ -362,10 +523,10 @@ def handleArgs() -> argparse.Namespace:
         default=True,
     )
     parser.add_argument(
-        "--zero-velocity",
-        help="use zero initial velocities",
+        "--initial-velocity",
+        help="if true, give the bodies initial velocities",
         action=argparse.BooleanOptionalAction,
-        default=True,
+        default=False,
     )
 
     parser.add_argument(
@@ -387,6 +548,7 @@ if __name__ == "__main__":
     data_dir = pathlib.Path(args.data_dir)  # don't let it be None
     image_dir = pathlib.Path(args.image_dir)  # don't let it be None
 
+    key, subkey = random.split(key)
     data = get_data(
         data_dir,
         args.D,
@@ -398,9 +560,26 @@ if __name__ == "__main__":
         args.n_val,
         args.n_test,
         args.uniform_mass,
-        args.zero_velocity,
-        key,
+        args.initial_velocity,
+        subkey,
         args.batch_size,
         image_dir,
         args.plot_gif,
     )
+
+    kwargs = {"batch_size": args.batch_size, "epochs": args.epochs, "verbose": args.verbose}
+
+    key, subkey = random.split(key)
+    model_list = [
+        {
+            **kwargs,
+            "model_name": "simple_conv",
+            "model": SimpleConv(
+                args.D, 1, args.n_bodies, 64, 3, args.side_length**args.D, key=subkey
+            ),
+            "lr": 3e-4,
+        },
+    ]
+
+    for model_kwargs in model_list:
+        train_and_eval(data, **model_kwargs)
