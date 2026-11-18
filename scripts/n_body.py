@@ -1,4 +1,5 @@
 import argparse
+import itertools as it
 import math
 import os
 import pathlib
@@ -14,7 +15,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import optax
 from jax import random
-from jaxtyping import Array, Float, PRNGKeyArray
+from jaxtyping import Array, Float, Int, PRNGKeyArray
 from matplotlib.collections import LineCollection
 from PIL import Image
 from torch.utils.data import DataLoader, Dataset
@@ -23,6 +24,7 @@ from latent_point_cloud import training, utils
 
 G = 1  # the gravitational constant. These are not in actual units yet, so we can use 1.
 TINY = 1e-5  # avoid divide by 0 issues
+LETTERS = "abcdefghijklmnopqrstuvxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
 
 # PLOTTING
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -89,26 +91,64 @@ def plot_pos(
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 
+def get_indices(
+    spatial_dims: tuple[int, ...],
+) -> tuple[Int[Array, "spatial D"], Float[Array, "spatial D"]]:
+    D = len(spatial_dims)
+    if spatial_dims != (spatial_dims[0],) * D:
+        raise NotImplementedError(f"get_indices: spatial_dims must be square, got {spatial_dims}")
+
+    spatial_range = [jnp.arange(N) for N in spatial_dims]
+    indices = jnp.stack(jnp.meshgrid(*spatial_range, indexing="ij"), axis=-1)
+
+    spatial_linspace = [jnp.linspace(-1, 1, num=N) for N in spatial_dims]
+    positions = jnp.stack(jnp.meshgrid(*spatial_linspace, indexing="ij"), axis=-1)
+    # indices and positions need to use the same indexing so that rotations work properly.
+    # But then when they are plotted (especially if using imshow), you need to make sure to swap
+    # everything properly.
+    return indices, positions
+
+
 def get_initial_bodies_cloud(
     N: int, D: int, n_bodies: int, key: PRNGKeyArray, uniform_mass: bool, initial_velocity: bool
-) -> tuple[Float[Array, "n_bodies D"], Float[Array, " n_bodies"], Float[Array, "n_bodies D"]]:
+) -> tuple[
+    Int[Array, "n_bodies D"],
+    Float[Array, "n_bodies D"],
+    Float[Array, " n_bodies"],
+    Float[Array, "n_bodies D"],
+]:
+    """
+    Generate the masses, positions, and initial velocities for n_bodies. If uniform_mass is false,
+    the masses are sorted from highest mass to lowest mass.
+
+    args:
+        N: the size of the image to place them in.
+        D: the dimension of the space
+        n_bodies: the number of bodies in the simulation
+        key: key for randomness
+        uniform_mass: if true, all bodies have the same mass, otherwise they are uniform [0.5,1]
+        initial_velocity: if true, generate random velocities from a normal distribution
+
+    returns:
+        the positions in D dimensions, masses, and velocities in D dimensions
+    """
     if (N % 2) != 0:
         raise ValueError(f"Side length must be even, got {N}")
 
     subkey1, subkey2, subkey3 = random.split(key, num=3)
+    indices, positions = get_indices((N,) * D)
 
     # Sample uniformly the cells: (spatial,D)
-    indices = jnp.stack(jnp.meshgrid(*(jnp.arange(N),) * D, indexing="ij"), axis=-1) - N / 2
-    positions = random.choice(
-        subkey1, indices.reshape((-1, D)), shape=(n_bodies,), replace=False, axis=0
-    )
+    choices = random.choice(subkey1, N**D, shape=(n_bodies, 1), replace=False, axis=0)
+    indices = jnp.take_along_axis(indices.reshape(-1, D), choices, axis=0)
+    positions = jnp.take_along_axis(positions.reshape(-1, D), choices, axis=0)
 
     # generate masses where the total mass is 20
     if uniform_mass:
         masses = 20 * jnp.ones(n_bodies) / n_bodies  # particles equal in size
     else:
-        masses = random.uniform(subkey2, shape=(n_bodies,), minval=0.5)
-        masses = masses * (20 / jnp.sum(masses))
+        masses = jnp.sort(random.uniform(subkey2, shape=(n_bodies,), minval=0.5), descending=True)
+        masses = masses * (2 / jnp.sum(masses))  # masses sum to 2
 
     if initial_velocity:
         velocities = random.normal(subkey3, shape=(n_bodies, D))
@@ -116,20 +156,16 @@ def get_initial_bodies_cloud(
     else:
         velocities = jnp.zeros((n_bodies, D))
 
-    return positions, masses, velocities
+    return indices, positions, masses, velocities
 
 
 def get_input_image(
-    N: int, positions: Float[Array, "n_bodies D"], masses: Float[Array, " n_bodies"]
+    N: int, indices: Int[Array, "n_bodies D"], masses: Float[Array, " n_bodies"]
 ) -> Float[Array, "1 spatial"]:
-    if (N % 2) != 0:
-        raise ValueError(f"Side length must be even, got {N}")
-
-    positions = (positions + N / 2).astype(int)  # return to [0...N] coordinates
-    D = positions.shape[1]
+    D = indices.shape[1]
     # likely a nice jax way of doing this, but this works
     point_mass = jnp.zeros((N,) * D)
-    for (x, y), mass in zip(positions, masses):
+    for (x, y), mass in zip(indices, masses):
         point_mass = point_mass.at[x, y].set(mass)
 
     return point_mass[None]
@@ -212,7 +248,7 @@ def integrate_over_time(
 
 
 class NBodyDataset(Dataset):
-    input_image: Float[Array, "n_samples channels spatial"]
+    input_images: Float[Array, "n_samples channels spatial"]
     last_positions: Float[Array, "n_samples n_bodies 1 D"]
     last_velocities: Float[Array, "n_samples n_bodies 1 D"]
     masses: Float[Array, "n_samples n_bodies"]
@@ -234,39 +270,33 @@ class NBodyDataset(Dataset):
     ) -> None:
         uniform_mass_str = "unif-mass" if uniform_mass else "no-unif-mass"
         initial_velocity_str = "initial-velocity" if initial_velocity else "no-initial-velocity"
-        data_name = f"{D}D_L{n_samples}_nbodies{n_bodies}_{uniform_mass_str}_{initial_velocity_str}_dt{dt}_T{T}"
+        data_name = f"{D}D_L{n_samples}_N{N}_nbodies{n_bodies}_{uniform_mass_str}_{initial_velocity_str}_dt{dt}_T{T}"
         file_path = root / data_type / f"{data_name}.npy"
         (root / data_type).mkdir(exist_ok=True)  # construct train/val/test dir if its missing
 
         if file_path.is_file():
             data_dict = jnp.load(file_path, allow_pickle=True).item()
-            self.masses = data_dict["masses"]
+            masses = data_dict["masses"]
+            indices = data_dict["indices"]  # (n_samples, n_bodies, D)
             positions = data_dict["positions"]  # (n_samples, timesteps, n_bodies, tensor)
             velocities = data_dict["velocities"]
             gravity_accs = data_dict["gravity_accs"]
             ts = data_dict["ts"]
-
-            self.input_images = eqx.filter_vmap(get_input_image)(N, positions[:, 0], self.masses)
-            self.last_positions = positions[:, -1, :, None]
-            self.last_velocities = velocities[:, -1, :, None]
         else:
-            initial_positions, masses, initial_velocities = eqx.filter_vmap(
+            indices, initial_positions, masses, initial_velocities = eqx.filter_vmap(
                 get_initial_bodies_cloud
             )(N, D, n_bodies, random.split(key, num=n_samples), uniform_mass, initial_velocity)
-            self.input_images = eqx.filter_vmap(get_input_image)(N, initial_positions, masses)
 
             # (n_samples, timesteps, n_bodies, tensor)
             positions, velocities, gravity_accs, ts = eqx.filter_vmap(integrate_over_time)(
                 initial_positions, masses, initial_velocities, dt, T
             )
-            self.last_positions = positions[:, -1, :, None]
-            self.last_velocities = velocities[:, -1, :, None]
-            self.masses = masses
 
             # save positions, velocities, masses, and output positions, construct images at runtime
             jnp.save(
                 file_path,
                 {
+                    "indices": indices,
                     "positions": positions,
                     "masses": masses,
                     "velocities": velocities,
@@ -275,6 +305,11 @@ class NBodyDataset(Dataset):
                 },
                 allow_pickle=True,
             )
+
+        self.masses = masses
+        self.input_images = eqx.filter_vmap(get_input_image)(N, indices, self.masses)
+        self.last_positions = positions[:, -1, :, None]
+        self.last_velocities = velocities[:, -1, :, None]
 
         if image_dir is not None:
             plot_pos(
@@ -292,9 +327,12 @@ class NBodyDataset(Dataset):
 
     def __getitem__(self: Self, idx: int) -> tuple[np.ndarray, np.ndarray]:
         # output as numpy array to be handled automatically by pytorch's dataloader
-        return np.asarray(self.input_images[idx]), np.asarray(
-            jnp.concat([self.last_positions[idx], self.last_velocities[idx]], axis=1)
-        )
+        return np.asarray(self.input_images[idx]), np.asarray(self.last_positions[idx])
+
+        # TODO: velocities are currently unused
+        # return np.asarray(self.input_images[idx]), np.asarray(
+        #     jnp.concat([self.last_positions[idx], self.last_velocities[idx]], axis=1)
+        # )
 
 
 def get_data(
@@ -357,6 +395,87 @@ class MSE(training.Loss):
         return jnp.mean(jnp.sum((x - y) ** 2, axis=tuple(range(1, x.ndim))))
 
 
+class MSEPermPointLoss(training.Loss):
+    """
+    The MSE loss between points, taking the minimum over permutations of the points. This should be
+    used as a metric at the end, not as a training loss.
+    """
+
+    def __call__(
+        self: Self,
+        x: Float[Array, "batch n_particles channels D"],
+        y: Float[Array, "batch n_particles channels D"],
+    ) -> Float[Array, ""]:
+        losses = []
+        for x_, y_ in zip(x, y):  # loop over batches
+            losses_ = []
+            for perm in it.permutations(range(len(x_))):
+                x_perm = x_[jnp.array(perm)]
+                losses_.append(jnp.sum((x_perm - y_) ** 2))
+
+            losses.append(jnp.min(jnp.stack(losses_)))  # min over permutations of points
+
+        return jnp.mean(jnp.stack(losses))  # mean over batch
+
+
+def count_params(model: eqx.Module) -> int:
+    get_array_sizes = lambda m: [
+        x.size for x in jax.tree_util.tree_leaves(m, is_leaf=eqx.is_array) if eqx.is_array(x)
+    ]
+    return sum(get_array_sizes(model))
+
+
+class MLPOnly(eqx.Module):
+    """
+    An even simpler model, an mlp from the image to positions.
+    """
+
+    D: int
+    n_particles: int
+    activation_f: Callable
+
+    layers: list[eqx.nn.Linear]
+    decoder: eqx.nn.Linear
+
+    def __init__(
+        self: Self,
+        D: int,
+        in_c: int,
+        n_particles: int,
+        width: int,
+        n_hidden_layers: int,
+        spatial_size: int,
+        activation_f: Callable = jax.nn.gelu,
+        *,
+        key: PRNGKeyArray,
+    ) -> None:
+        self.D = D
+        self.n_particles = n_particles
+        self.activation_f = activation_f
+
+        key, subkey = random.split(key)
+        self.layers = [eqx.nn.Linear(spatial_size * in_c, width, key=subkey)]
+        for _ in range(n_hidden_layers):
+            key, subkey = random.split(key)
+            self.layers.append(eqx.nn.Linear(width, width, key=subkey))
+
+        key, subkey = random.split(key)
+        self.decoder = eqx.nn.Linear(width, n_particles * D * 2, key=subkey)
+
+    def __call__(self: Self, x: Float[Array, "in_c spatial"]) -> Float[Array, "n_particles 2 D"]:
+        x = x.ravel()
+        for layer in self.layers:
+            x = self.activation_f(layer(x))
+
+        x = self.decoder(x.ravel())
+        positions = x[: self.n_particles * self.D].reshape(self.n_particles, self.D)
+        velocities = x[self.n_particles * self.D : 2 * self.n_particles * self.D].reshape(
+            self.n_particles, self.D
+        )
+
+        return positions[:, None]
+
+
 class SimpleConv(eqx.Module):
     """
     A simple convolution model, takes in an image with in_c channels and outputs n_particles with
@@ -411,7 +530,92 @@ class SimpleConv(eqx.Module):
             self.n_particles, self.D
         )
 
-        return jnp.stack([positions, velocities], axis=1)
+        return positions[:, None]
+        # return jnp.stack([positions, velocities], axis=1)
+
+
+class LatentPointCloud(eqx.Module):
+    D: int
+    n_particles: int
+    activation_f: Callable
+
+    conv_layers: list[eqx.nn.Conv]
+    connecter_layers: list[eqx.nn.Linear]
+
+    def __init__(
+        self: Self,
+        D: int,
+        image_c: int,
+        n_particles: int,
+        conv_width: int,
+        n_hidden_conv: int,
+        spatial_dims: Sequence[int],
+        connecter_width: int,
+        n_hidden_connecter: int,
+        kernel_size: int | Sequence[int] = 3,
+        activation_f: Callable = jax.nn.gelu,
+        *,
+        key: PRNGKeyArray,
+    ) -> None:
+        self.D = D
+        self.n_particles = n_particles
+        self.activation_f = activation_f
+
+        key, subkey = random.split(key)
+        layer_widths = [image_c] + [conv_width] * n_hidden_conv
+        self.conv_layers = []
+        for i in range(len(layer_widths) - 1):
+            in_c, out_c = layer_widths[i : i + 2]
+            key, subkey = random.split(key)
+            self.conv_layers.append(
+                eqx.nn.Conv(D, in_c, out_c, kernel_size, padding="SAME", key=subkey)
+            )
+
+        last_c = layer_widths[-1]
+        spatial_size = math.prod(spatial_dims)
+        in_c = math.comb(spatial_size, 2) + spatial_size + spatial_size * last_c
+        layer_widths = (
+            [in_c] + [connecter_width] * n_hidden_connecter + [spatial_size * n_particles]
+        )
+        self.connecter_layers = []
+        for i in range(len(layer_widths) - 1):
+            in_c, out_c = layer_widths[i : i + 2]
+            key, subkey = random.split(key)
+            self.connecter_layers.append(eqx.nn.Linear(in_c, out_c, key=subkey))
+
+    def __call__(
+        self: Self, x: Float[Array, "in_c spatial"]
+    ) -> Float[Array, "n_particles channels D"]:
+        # pass it through the conv layers
+        for layer in self.conv_layers[:-1]:
+            x = self.activation_f(layer(x))
+
+        x = self.conv_layers[-1](x)
+
+        spatial_dims = x.shape[1:]
+        x = x.reshape(x.shape[0], -1)  # (channels,spatial) -> (channels,spatial_flat)
+
+        # (spatial,D)
+        _, grid_positions = get_indices(spatial_dims)
+
+        grid_positions = grid_positions.reshape(-1, self.D)
+        n_points = len(grid_positions)
+
+        # TODO: grid_positions is fixed, so this will always be the same thing, seems silly.
+        dots = grid_positions @ grid_positions.T  # (n_points,n_points)
+        dots = dots[jnp.triu_indices(n_points)].reshape(-1)  # (n_points choose 2,)
+
+        x = jnp.concat([dots, x.ravel()])
+
+        for layer in self.connecter_layers[:-1]:
+            x = self.activation_f(layer(x))
+
+        coeffs = self.connecter_layers[-1](x).reshape(self.n_particles, math.prod(spatial_dims))
+        # scalars are universal setup
+        coeffs = coeffs / (jnp.sum(coeffs, axis=1, keepdims=True) + 1e-5)  # (in_c,)
+        out = jnp.sum(coeffs[..., None] * grid_positions[None], axis=1)  # (n_particles,D)
+
+        return out[:, None]
 
 
 def train_and_eval(
@@ -426,15 +630,19 @@ def train_and_eval(
     images_dir: pathlib.Path | None = None,
     verbose: int = 1,
     is_wandb: bool = False,
+    wandb_project: str = "",
 ) -> tuple[Float[Array, ""], ...]:
+    if is_wandb:
+        assert wandb_project != "", "wandb_project must be provided when is_wandb=True"
+
     train_dl, val_dl, test_dl = data
     assert isinstance(train_dl.dataset, NBodyDataset)
-
-    # print(f"Model params: {models.count_params(model):,}")
 
     mapper = training.Mapper(MSE())
 
     model_name_extended = f"{model_name}_L{len(train_dl.dataset)}_e{epochs}"
+    print(f"{model_name_extended} params: {count_params(model):,}")
+
     model_path = model_dir / f"{model_name_extended}.eqx" if model_dir else None
     if model_path and model_path.is_file() and not overwrite_save_model:
         trained_model, _ = training.load(model_path, model)
@@ -456,6 +664,8 @@ def train_and_eval(
             save_model=model_path,
             verbose=verbose,
             is_wandb=is_wandb,
+            wandb_project=wandb_project,
+            model_name=model_name_extended,
         )
 
     train_loss = training.evaluate_loop(mapper, trained_model, train_dl)
@@ -464,6 +674,10 @@ def train_and_eval(
     print(f"Val Loss: {val_loss}")
     test_loss = training.evaluate_loop(mapper, trained_model, test_dl)
     print(f"Test Loss: {test_loss}")
+
+    perm_mapper = training.Mapper(MSEPermPointLoss())
+    test_perm_loss = training.evaluate_loop(perm_mapper, trained_model, test_dl)
+    print(f"Test Perm Loss: {test_perm_loss}")
 
     return train_loss, val_loss, test_loss
 
@@ -538,17 +752,39 @@ if __name__ == "__main__":
         args.plot_gif,
     )
 
-    kwargs = {"batch_size": args.batch_size, "epochs": args.epochs, "verbose": args.verbose}
+    kwargs = {
+        "batch_size": args.batch_size,
+        "epochs": args.epochs,
+        "verbose": args.verbose,
+        "is_wandb": args.wandb,
+        "wandb_project": args.wandb_project,
+    }
 
-    key, subkey = random.split(key)
+    key, *subkeys = random.split(key, num=10)
     model_list = [
         {
             **kwargs,
             "model_name": "simple_conv",
             "model": SimpleConv(
-                args.D, 1, args.n_bodies, 64, 3, args.side_length**args.D, key=subkey
+                args.D, 1, args.n_bodies, 64, 3, args.side_length**args.D, key=subkeys[0]
             ),
             "lr": 3e-4,
+        },
+        {
+            **kwargs,
+            "model_name": "mlp_only",
+            "model": MLPOnly(
+                args.D, 1, args.n_bodies, 64, 0, args.side_length**args.D, key=subkeys[1]
+            ),
+            "lr": 1e-2,
+        },
+        {
+            **kwargs,
+            "model_name": "LatentPointCloud",
+            "model": LatentPointCloud(
+                args.D, 1, args.n_bodies, 64, 2, (args.side_length,) * args.D, 32, 2, key=subkeys[1]
+            ),
+            "lr": 1e-3,
         },
     ]
 
