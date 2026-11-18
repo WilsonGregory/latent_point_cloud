@@ -12,3 +12,4 @@ wheels/
 .vscode/
 images/
 data/
+wandb/

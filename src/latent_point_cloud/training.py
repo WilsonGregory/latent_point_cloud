@@ -10,9 +10,10 @@ import equinox as eqx
 import jax
 import jax.numpy as jnp
 import optax
-import wandb
 from jaxtyping import Array, Float
 from torch.utils.data import DataLoader
+
+import wandb
 
 # ~~~~~~~~~~~~~~~~~~~~~~ Saving/Loading ~~~~~~~~~~~~~~~~~~~~~~
 
